@@ -445,6 +445,20 @@
     }
 }
 
+- (void)_deriveNameForConfig:(GSUTMConfiguration *)cfg fromURL:(NSURL *)url
+{
+    if ([[cfg.name stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]] length] == 0
+        || [cfg.name isEqualToString:@"Virtual Machine"]) {
+        NSString *dirName = [[url path] lastPathComponent];
+        if ([dirName isEqualToString:@"config.plist"])
+            dirName = [[[url URLByDeletingLastPathComponent] path] lastPathComponent];
+        if ([dirName hasSuffix:@".utm"])
+            dirName = [dirName substringToIndex:[dirName length] - 4];
+        if ([dirName length] > 0)
+            cfg.name = dirName;
+    }
+}
+
 - (BOOL)_vmListContainsURL:(NSString *)path
 {
     NSString *bundleDir = path;
@@ -480,6 +494,7 @@
         _configPath = [[configURL path] retain];
         _vmLoaded = YES;
         [_configuration retain];
+        [self _deriveNameForConfig:_configuration fromURL:configURL];
         if (![self _vmListContainsURL:_configPath]) {
             [_vmEntries addObject:_configuration];
         }
@@ -508,6 +523,7 @@
         if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
             GSUTMConfiguration *cfg = [GSUTMConfiguration loadFromURL:[url URLByAppendingPathComponent:@"config.plist"] error:NULL];
             if (cfg) {
+                [self _deriveNameForConfig:cfg fromURL:[url URLByAppendingPathComponent:@"config.plist"]];
                 [_vmEntries addObject:cfg];
             }
         }
