@@ -752,8 +752,9 @@ NSString *const GSUTMErrorDomain = @"GSUTMErrorDomain";
         } else if ([soundObj isKindOfClass:[NSDictionary class]]) {
             soundHw = [soundObj objectForKey:@"Hardware"] ?: [soundObj objectForKey:@"SoundCard"];
         }
-        if (soundHw || _soundEnabled) {
+            if (soundHw || _soundEnabled) {
             if (!soundHw) soundHw = _soundCard;
+            if ([soundHw isEqualToString:@"hda"]) soundHw = @"intel-hda";
             soundHw = [self availableDeviceFor:soundHw arch:_architecture];
             if (soundHw && [soundHw length] > 0) {
                 [args addObject:@"-audiodev"];
@@ -863,6 +864,9 @@ NSString *const GSUTMErrorDomain = @"GSUTMErrorDomain";
             if ([iface isEqualToString:@"ide"]) {
                 NSString *devName = isCd ? @"ide-cd" : @"ide-hd";
                 NSMutableString *devArg = [NSMutableString stringWithFormat:@"%@,drive=%@", devName, driveId];
+                if (isPcCompatible) {
+                    [devArg appendFormat:@",bus=ide.%d", bootIdx];
+                }
                 [devArg appendFormat:@",bootindex=%d", bootIdx];
                 [args addObject:@"-device"];
                 [args addObject:devArg];
