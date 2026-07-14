@@ -311,6 +311,24 @@ NSString *const GSUTMErrorDomain = @"GSUTMErrorDomain";
     }
 }
 
+- (NSString *)_findFile:(NSString *)name inDirectory:(NSString *)dir
+{
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+    if (![fm fileExistsAtPath:dir isDirectory:&isDir] || !isDir) return nil;
+    NSString *candidate = [dir stringByAppendingPathComponent:name];
+    if ([fm isReadableFileAtPath:candidate]) return candidate;
+    NSArray *contents = [fm contentsOfDirectoryAtPath:dir error:NULL];
+    for (NSString *item in contents) {
+        NSString *sub = [dir stringByAppendingPathComponent:item];
+        if ([fm fileExistsAtPath:sub isDirectory:&isDir] && isDir) {
+            NSString *found = [self _findFile:name inDirectory:sub];
+            if (found) return found;
+        }
+    }
+    return nil;
+}
+
 - (void)resolveDrivePathsWithBaseURL:(NSURL *)baseURL
 {
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -321,18 +339,13 @@ NSString *const GSUTMErrorDomain = @"GSUTMErrorDomain";
         if ([path isAbsolutePath]) {
             if ([fm isReadableFileAtPath:path]) continue;
             /* Absolute path doesn't exist — try resolving filename relative to bundle */
-            NSString *file = [path lastPathComponent];
-            for (NSString *sub in @[@"Data", @"Images", @""]) {
-                NSString *candidate = [[baseURL URLByAppendingPathComponent:sub isDirectory:YES]
-                                        URLByAppendingPathComponent:file].path;
-                if ([fm isReadableFileAtPath:candidate]) { drive[@"ImagePath"] = candidate; break; }
-            }
-            continue;
+            path = [path lastPathComponent];
         }
+        /* Search in bundle subdirectories for the file */
         for (NSString *sub in @[@"Data", @"Images", @""]) {
-            NSString *candidate = [[baseURL URLByAppendingPathComponent:sub isDirectory:YES]
-                                    URLByAppendingPathComponent:path].path;
-            if ([fm isReadableFileAtPath:candidate]) { drive[@"ImagePath"] = candidate; break; }
+            NSString *searchDir = [[baseURL URLByAppendingPathComponent:sub isDirectory:YES] path];
+            NSString *found = [self _findFile:path inDirectory:searchDir];
+            if (found) { drive[@"ImagePath"] = found; break; }
         }
     }
 }
