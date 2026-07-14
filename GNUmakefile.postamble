@@ -1,0 +1,2 @@
+after-app:: 
+	cp -f Resources/SystemEmulator.desktop $(APP_NAME).app/Resources/

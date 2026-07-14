@@ -1,0 +1,13 @@
+ADDITIONAL_CPPFLAGS +=
+ADDITIONAL_OBJCFLAGS +=
+ADDITIONAL_CFLAGS +=
+ADDITIONAL_LDFLAGS +=
+
+ADDITIONAL_INCLUDE_DIRS += \
+	-I/usr/include \
+	-I/Library/Frameworks/GSAssistantFramework.framework/Headers
+ADDITIONAL_LIB_DIRS += \
+	-L/usr/lib/x86_64-linux-gnu \
+	-L/Library/Frameworks/GSAssistantFramework.framework
+
+ADDITIONAL_GUI_LIBS += -lX11 -ldispatch -lGSAssistantFramework
