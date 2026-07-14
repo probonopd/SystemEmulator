@@ -4,6 +4,8 @@
 
 @implementation GSUTMAppDelegate
 
+@synthesize pendingOpenPath = _pendingOpenPath;
+
 - (void)setupMainMenu
 {
     _mainMenu = [[NSMenu alloc] init];

@@ -129,11 +129,7 @@ NSString *const GSUTMErrorDomain = @"GSUTMErrorDomain";
 
 - (NSString *)qemuBinary
 {
-    NSString *name;
-    if ([_architecture isEqualToString:@"aarch64"] || [_architecture hasPrefix:@"arm64"])
-        name = @"qemu-system-aarch64";
-    else
-        name = @"qemu-system-x86_64";
+    NSString *name = [NSString stringWithFormat:@"qemu-system-%@", _architecture];
     NSArray *paths = @[@"/bin", @"/usr/bin", @"/usr/local/bin", @"/opt/local/bin",
                        @"/opt/homebrew/bin", @"/run/current-system/sw/bin"];
     for (NSString *dir in paths) {
@@ -144,25 +140,48 @@ NSString *const GSUTMErrorDomain = @"GSUTMErrorDomain";
     return name;
 }
 
-- (NSString *)driveInterfaceDevice:(NSString *)interface imageType:(NSString *)imageType
+#pragma mark - Architecture Feature Flags
+
+- (BOOL)_isSparc { return [_architecture hasPrefix:@"sparc"]; }
+- (BOOL)_isM68k { return [_architecture isEqualToString:@"m68k"]; }
+- (BOOL)_isPPC { return [_architecture isEqualToString:@"ppc"] || [_architecture isEqualToString:@"ppc64"]; }
+- (BOOL)_isS390x { return [_architecture isEqualToString:@"s390x"]; }
+- (BOOL)_isPcCompatible { return [_architecture isEqualToString:@"x86_64"] || [_architecture isEqualToString:@"i386"]; }
+
+- (BOOL)_hasAgentSupport
 {
-    NSString *iface = [interface lowercaseString];
-    BOOL isCd = [imageType isEqualToString:@"cd"] || [imageType isEqualToString:@"CD"];
-    if ([iface isEqualToString:@"ide"]) return isCd ? @"ide-cd" : @"ide-hd";
-    if ([iface isEqualToString:@"virtio"] || [iface isEqualToString:@"VirtIO"]) return @"virtio-blk-pci";
-    if ([iface isEqualToString:@"scsi"]) return isCd ? @"scsi-cd" : @"scsi-hd";
-    if ([iface isEqualToString:@"nvme"]) return @"nvme";
-    if ([iface isEqualToString:@"usb"] || [iface isEqualToString:@"USB"]) return @"usb-storage";
-    return isCd ? @"ide-cd" : @"ide-hd";
+    NSSet *noAgent = [NSSet setWithObjects:@"avr", @"m68k", @"microblaze", @"microblazeel",
+                      @"ppc", @"ppc64", @"rx", @"sparc", @"sparc64", @"tricore", nil];
+    return ![noAgent containsObject:_architecture];
+}
+
+- (BOOL)_hasUsbSupport
+{
+    NSSet *noUsb = [NSSet setWithObjects:@"s390x", @"sparc", @"sparc64", @"m68k", nil];
+    return ![noUsb containsObject:_architecture];
+}
+
+- (BOOL)_hasSharingSupport
+{
+    NSSet *noSharing = [NSSet setWithObjects:@"sparc", @"sparc64", nil];
+    return ![noSharing containsObject:_architecture];
+}
+
+- (BOOL)_isClassicMacM68k
+{
+    return [self _isM68k] && [_target isEqualToString:@"q800"];
+}
+
+- (BOOL)_isClassicMacNewWorld
+{
+    return [self _isPPC] && [_target isEqualToString:@"mac99"];
 }
 
 #pragma mark - Device Availability
 
 - (NSString *)_qemuBinaryForArch:(NSString *)arch
 {
-    if ([arch isEqualToString:@"aarch64"] || [arch hasPrefix:@"arm64"])
-        return @"qemu-system-aarch64";
-    return @"qemu-system-x86_64";
+    return [NSString stringWithFormat:@"qemu-system-%@", arch];
 }
 
 - (NSSet *)_availableDevicesForArch:(NSString *)arch
@@ -198,7 +217,6 @@ NSString *const GSUTMErrorDomain = @"GSUTMErrorDomain";
             if (r1.location != NSNotFound && r2.location != NSNotFound) {
                 NSString *name = [line substringWithRange:NSMakeRange(r1.location + 1, r2.location)];
                 [devices addObject:name];
-                /* Also check for alias */
                 NSRange aliasR = [line rangeOfString:@"alias \""];
                 if (aliasR.location != NSNotFound) {
                     NSString *rest = [line substringFromIndex:aliasR.location + 7];
@@ -222,7 +240,6 @@ NSString *const GSUTMErrorDomain = @"GSUTMErrorDomain";
 - (NSString *)availableDeviceFor:(NSString *)device arch:(NSString *)arch
 {
     if ([self isDeviceAvailable:device arch:arch]) return device;
-    /* Try fallbacks */
     NSDictionary *fallbacks = @{
         @"virtio-ramfb": @[@"VGA", @"virtio-vga", @"ramfb", @"cirrus-vga"],
         @"virtio-ramfb-gl": @[@"ramfb", @"VGA"],
@@ -251,7 +268,7 @@ NSString *const GSUTMErrorDomain = @"GSUTMErrorDomain";
     if ([_networkCard isEqualToString:@"virtio"]) return @"virtio-net-pci";
     if ([_networkCard isEqualToString:@"ne2k_pci"]) return @"ne2k_pci";
     if ([_architecture isEqualToString:@"aarch64"]) return @"virtio-net-pci";
-    return @"e1000";
+    return _networkCard ?: @"e1000";
 }
 
 - (NSString *)diskImagePath
@@ -327,285 +344,722 @@ NSString *const GSUTMErrorDomain = @"GSUTMErrorDomain";
     return nil;
 }
 
+- (NSString *)_machineProperties
+{
+    BOOL isPc = [self _isPcCompatible];
+    BOOL isUsb = [self _hasUsbSupport];
+    NSString *target = [self targetString];
+    NSMutableString *props = [NSMutableString string];
+
+    if (isPc) {
+        [props appendString:@",vmport=off"];
+        if (isUsb && !_inputLegacy) {
+            [props appendString:@",i8042=off"];
+        }
+        [props appendString:@",hpet=off"];
+    }
+
+    if ([target isEqualToString:@"virt"] || [target hasPrefix:@"virt-"]) {
+        if ([_architecture isEqualToString:@"aarch64"] && _cpuCount > 8) {
+            [props appendString:@",gic-version=3"];
+        }
+    }
+
+    if ([self _isClassicMacNewWorld]) {
+        [props appendString:@",via=pmu"];
+    }
+
+    return props;
+}
+
+- (NSString *)_cleanupName:(NSString *)name
+{
+    NSCharacterSet *allowed = [NSCharacterSet alphanumericCharacterSet];
+    NSMutableCharacterSet *mutable = [[allowed mutableCopy] autorelease];
+    [mutable formUnionWithCharacterSet:[NSCharacterSet whitespaceCharacterSet]];
+    return [[name componentsSeparatedByCharactersInSet:[mutable invertedSet]] componentsJoinedByString:@""];
+}
+
 - (NSArray<NSString *> *)qemuArguments
 {
     NSMutableArray *args = [NSMutableArray array];
     NSString *uuid = [self _uuidString] ?: @"00000000-0000-0000-0000-000000000000";
 
-    /* -S removed: VM starts immediately (no QMP continue sent) */
+    BOOL isSparc = [self _isSparc];
+    BOOL isM68k = [self _isM68k];
+    BOOL isS390x = [self _isS390x];
+    BOOL isPcCompatible = [self _isPcCompatible];
+    BOOL hasUsb = [self _hasUsbSupport];
+    BOOL hasAgent = [self _hasAgentSupport];
+    BOOL isClassicMacM68k = [self _isClassicMacM68k];
+    BOOL isClassicMacNewWorld = [self _isClassicMacNewWorld];
+    BOOL isUsbUsed = hasUsb && !_inputLegacy;
 
-    /* === 2. SPICE === */
-    [args addObject:@"-spice"];
-    [args addObject:[NSString stringWithFormat:@"unix=on,addr=%@.spice,disable-ticketing=on,image-compression=off,playback-compression=off,streaming-video=off,gl=off", uuid]];
+    id qemuSection = _rawPlist[@"QEMU"];
+    BOOL wantsHostCPU = [_cpu isEqualToString:@"host"];
+    BOOL hasUefi = NO;
+    BOOL hasHypervisor = NO;
+    BOOL hasRng = NO;
+    BOOL hasBalloon = NO;
+    BOOL hasRtcLocalTime = NO;
+    BOOL isDisposable = NO;
+    NSString *spicePassword = nil;
+    NSArray *cpuFlagsAdd = nil;
+    NSArray *cpuFlagsRemove = nil;
+    if ([qemuSection isKindOfClass:[NSDictionary class]]) {
+        hasHypervisor = [qemuSection[@"Hypervisor"] boolValue];
+        hasUefi = [qemuSection[@"UEFIBoot"] boolValue];
+        hasRng = [qemuSection[@"RNGDevice"] boolValue];
+        hasBalloon = [qemuSection[@"BalloonDevice"] boolValue];
+        hasRtcLocalTime = [qemuSection[@"HasRTCLocalTime"] boolValue];
+        isDisposable = [qemuSection[@"Disposable"] boolValue];
+        spicePassword = qemuSection[@"SpicePassword"];
+        cpuFlagsAdd = qemuSection[@"CpuFlagsAdd"];
+        cpuFlagsRemove = qemuSection[@"CpuFlagsRemove"];
+        if (!wantsHostCPU && hasHypervisor) {
+            wantsHostCPU = YES;
+        }
+    }
 
-    /* === 3. QMP Monitor === */
+    id sharingSection = _rawPlist[@"Sharing"];
+    BOOL clipboardSharing = NO;
+    BOOL directorySharing = NO;
+    if ([sharingSection isKindOfClass:[NSDictionary class]]) {
+        clipboardSharing = [sharingSection[@"ClipboardSharing"] boolValue];
+        directorySharing = [sharingSection[@"DirectorySharing"] boolValue];
+    }
+
+    id displayObj = _rawPlist[@"Display"];
+    id serialArr = _rawPlist[@"Serial"];
+    id netObj = _rawPlist[@"Networking"] ?: _rawPlist[@"Network"];
+    id soundObj = _rawPlist[@"Sound"];
+    id inputSection = _rawPlist[@"Input"];
+    NSInteger maxUsbShare = 3;
+    if ([inputSection isKindOfClass:[NSDictionary class]]) {
+        maxUsbShare = [[inputSection objectForKey:@"MaximumUsbShare"] integerValue];
+    }
+
+    /* === 1. SPICE === */
+    {
+        NSMutableString *spiceArg = [NSMutableString stringWithFormat:@"unix=on,addr=%@.spice", uuid];
+        if ([spicePassword length] > 0) {
+            [spiceArg appendString:@",password-secret=secspice0"];
+        } else {
+            [spiceArg appendString:@",disable-ticketing=on"];
+        }
+        [spiceArg appendString:@",image-compression=off,playback-compression=off,streaming-video=off,gl=off"];
+        [args addObject:@"-spice"];
+        [args addObject:spiceArg];
+    }
+
+    /* === 2. QMP Monitor === */
     [args addObject:@"-chardev"];
-    [args addObject:[NSString stringWithFormat:@"spiceport,name=org.qemu.monitor.qmp.0,id=org.qemu.monitor.qmp"]];
+    [args addObject:@"spiceport,name=org.qemu.monitor.qmp.0,id=org.qemu.monitor.qmp"];
     [args addObject:@"-mon"];
     [args addObject:@"chardev=org.qemu.monitor.qmp,mode=control"];
 
-    /* === 4. -nodefaults -vga none -display sdl === */
-    [args addObject:@"-nodefaults"];
-    [args addObject:@"-vga"];
-    [args addObject:@"none"];
+    /* === 3. -nodefaults: skip for SPARC (needs built-in devices) === */
+    if (!isSparc) {
+        [args addObject:@"-nodefaults"];
+        [args addObject:@"-vga"];
+        [args addObject:@"none"];
+    }
+
+    /* === 4. SPICE password object === */
+    if ([spicePassword length] > 0) {
+        [args addObject:@"-object"];
+        [args addObject:[NSString stringWithFormat:@"secret,id=secspice0,data=%@", spicePassword]];
+    }
+
+    /* === 5. Display === */
+    {
+        BOOL hasDisplayDevice = NO;
+        if (isSparc) {
+            NSString *vgaCard = @"tcx";
+            if ([displayObj isKindOfClass:[NSDictionary class]]) {
+                NSString *hw = [displayObj objectForKey:@"DisplayCard"] ?: [displayObj objectForKey:@"Hardware"];
+                if (hw) vgaCard = hw;
+            }
+            [args addObject:@"-vga"];
+            [args addObject:vgaCard];
+            hasDisplayDevice = YES;
+        } else if ([displayObj isKindOfClass:[NSArray class]] && [displayObj count] > 0) {
+            for (NSDictionary *d in displayObj) {
+                if ([d isKindOfClass:[NSDictionary class]]) {
+                    NSString *hw = [d objectForKey:@"Hardware"];
+                    if (hw) {
+                        hw = [self availableDeviceFor:hw arch:_architecture];
+                        [args addObject:@"-device"];
+                        [args addObject:hw];
+                        hasDisplayDevice = YES;
+                    }
+                }
+            }
+        } else if ([displayObj isKindOfClass:[NSDictionary class]]) {
+            NSString *hw = [displayObj objectForKey:@"Hardware"];
+            if (hw) {
+                hw = [self availableDeviceFor:hw arch:_architecture];
+                [args addObject:@"-device"];
+                [args addObject:hw];
+                hasDisplayDevice = YES;
+            }
+        }
+        if (!hasDisplayDevice) {
+            [args addObject:@"-device"];
+            [args addObject:[self availableDeviceFor:@"virtio-ramfb" arch:_architecture]];
+        }
+    }
     [args addObject:@"-display"];
     [args addObject:@"sdl"];
 
-    /* === 5. Network === */
-    id networkArr = [_rawPlist objectForKey:@"Network"];
-    NSDictionary *netConfig = nil;
-    if ([networkArr isKindOfClass:[NSArray class]] && [networkArr count] > 0) {
-        id first = [networkArr objectAtIndex:0];
-        if ([first isKindOfClass:[NSDictionary class]]) netConfig = first;
-    } else if ([networkArr isKindOfClass:[NSDictionary class]]) netConfig = networkArr;
-    NSString *netHw = netConfig ? ([netConfig objectForKey:@"Hardware"] ?: @"virtio-net-pci") : @"e1000";
-    NSString *macAddr = netConfig ? ([netConfig objectForKey:@"MacAddress"] ?: @"") : @"";
-    netHw = [self availableDeviceFor:netHw arch:_architecture];
-    if ([macAddr length] > 0) {
-        [args addObject:@"-device"];
-        [args addObject:[NSString stringWithFormat:@"%@,mac=%@,netdev=net0", netHw, macAddr]];
-    } else {
-        [args addObject:@"-device"];
-        [args addObject:[NSString stringWithFormat:@"%@,netdev=net0", netHw]];
-    }
-
-    /* Netdev mode: shared/user/bridged */
-    NSString *netMode = netConfig ? ([netConfig objectForKey:@"Mode"] ?: @"shared") : @"shared";
-    if ([netMode isEqualToString:@"shared"]) {
-        [args addObject:@"-netdev"];
-        [args addObject:@"user,id=net0"];
-    } else if ([netMode isEqualToString:@"bridged"]) {
-        NSString *iface = [netConfig objectForKey:@"BridgeInterface"] ?: @"eth0";
-        [args addObject:@"-netdev"];
-        [args addObject:[NSString stringWithFormat:@"bridge,id=net0,br=%@", iface]];
-    } else {
-        [args addObject:@"-netdev"];
-        [args addObject:@"user,id=net0"];
-    }
-
-    /* === 6. Display === */
-    id displayArr = [_rawPlist objectForKey:@"Display"];
-    NSString *displayDev = @"virtio-ramfb";
-    if ([displayArr isKindOfClass:[NSArray class]] && [displayArr count] > 0) {
-        id first = [displayArr objectAtIndex:0];
-        if ([first isKindOfClass:[NSDictionary class]]) {
-            NSString *hw = [first objectForKey:@"Hardware"];
-            if (hw) displayDev = hw;
+    /* === 6. Network (multi-card with indexing) === */
+    {
+        NSMutableArray *netConfigs = [NSMutableArray array];
+        if ([netObj isKindOfClass:[NSArray class]]) {
+            [netConfigs addObjectsFromArray:netObj];
+        } else if ([netObj isKindOfClass:[NSDictionary class]]) {
+            [netConfigs addObject:netObj];
         }
-    } else if ([displayArr isKindOfClass:[NSDictionary class]]) {
-        NSString *hw = [displayArr objectForKey:@"Hardware"];
-        if (hw) displayDev = hw;
+
+        if ([netConfigs count] == 0) {
+            [args addObject:@"-nic"];
+            [args addObject:@"none"];
+        } else {
+            for (NSUInteger i = 0; i < [netConfigs count]; i++) {
+                NSDictionary *netDict = netConfigs[i];
+                NSString *macAddr = netDict[@"NetworkCardMAC"] ?: netDict[@"MacAddress"] ?: @"";
+                NSString *netMode = netDict[@"NetworkMode"] ?: netDict[@"Mode"] ?: @"shared";
+
+                if (isSparc || (isClassicMacM68k && [netDict[@"Hardware"] isEqualToString:@"dp8393x"])) {
+                    NSMutableString *netArg = [NSMutableString stringWithFormat:@"nic,netdev=net%lu", (unsigned long)i];
+                    if (isSparc) {
+                        [netArg appendString:@",model=lance"];
+                    }
+                    if ([macAddr length] > 0) {
+                        [netArg appendFormat:@",macaddr=%@", macAddr];
+                    }
+                    [args addObject:@"-net"];
+                    [args addObject:netArg];
+                } else {
+                    NSString *netHw = netDict[@"Hardware"] ?: _networkCard ?: @"rtl8139";
+                    netHw = [self availableDeviceFor:netHw arch:_architecture];
+                    NSMutableString *devArg = [NSMutableString stringWithFormat:@"%@,netdev=net%lu", netHw, (unsigned long)i];
+                    if ([macAddr length] > 0) {
+                        [devArg appendFormat:@",mac=%@", macAddr];
+                    }
+                    [args addObject:@"-device"];
+                    [args addObject:devArg];
+                }
+
+                [args addObject:@"-netdev"];
+                if ([netMode isEqualToString:@"shared"] || [netMode isEqualToString:@"emulated"]) {
+                    NSMutableString *netdevArg = [NSMutableString stringWithFormat:@"user,id=net%lu", (unsigned long)i];
+                    NSString *guestAddr = netDict[@"VlanGuestAddress"];
+                    if (guestAddr) {
+                        [netdevArg appendFormat:@",net=%@", guestAddr];
+                    }
+                    NSString *hostAddr = netDict[@"VlanHostAddress"];
+                    if (hostAddr) {
+                        [netdevArg appendFormat:@",host=%@", hostAddr];
+                    }
+                    NSArray *portForwards = netDict[@"PortForward"];
+                    if ([portForwards isKindOfClass:[NSArray class]]) {
+                        for (NSDictionary *pf in portForwards) {
+                            NSString *proto = pf[@"Protocol"] ?: @"tcp";
+                            NSString *ha = pf[@"HostAddress"] ?: @"";
+                            NSString *hp = pf[@"HostPort"];
+                            NSString *ga = pf[@"GuestAddress"] ?: @"";
+                            NSString *gp = pf[@"GuestPort"];
+                            if (hp && gp) {
+                                [netdevArg appendFormat:@",hostfwd=%@:%@:%@-%@:%@",
+                                 [proto lowercaseString], ha, hp, ga, gp];
+                            }
+                        }
+                    }
+                    if ([netDict[@"IsIsolateFromHost"] boolValue]) {
+                        [netdevArg appendString:@",restrict=on"];
+                    }
+                    [args addObject:netdevArg];
+                } else if ([netMode isEqualToString:@"bridged"]) {
+                    NSString *iface = netDict[@"BridgeInterface"] ?: @"eth0";
+                    [args addObject:[NSString stringWithFormat:@"bridge,id=net%lu,br=%@", (unsigned long)i, iface]];
+                } else if ([netMode isEqualToString:@"host"]) {
+                    [args addObject:[NSString stringWithFormat:@"user,id=net%lu,restrict=on", (unsigned long)i]];
+                } else {
+                    [args addObject:[NSString stringWithFormat:@"user,id=net%lu", (unsigned long)i]];
+                }
+            }
+        }
     }
-    displayDev = [self availableDeviceFor:displayDev arch:_architecture];
-    [args addObject:@"-device"];
-    [args addObject:displayDev];
 
-    /* === 7. CPU + SMP === */
-    id qemuSection = [_rawPlist objectForKey:@"QEMU"];
-    BOOL wantsHost = [_cpu isEqualToString:@"host"];
-    if (!wantsHost && [qemuSection isKindOfClass:[NSDictionary class]])
-        wantsHost = [qemuSection[@"Hypervisor"] boolValue];
-    if (wantsHost) {
-        [args addObject:@"-cpu"];
-        [args addObject:@"host"];
-    } else if (![_cpu isEqualToString:@"default"]) {
-        [args addObject:@"-cpu"];
-        [args addObject:_cpu];
-    } else if ([_architecture isEqualToString:@"aarch64"]) {
-        [args addObject:@"-cpu"];
-        [args addObject:@"cortex-a72"];
+    /* === 7. Serial === */
+    if ([serialArr isKindOfClass:[NSArray class]]) {
+        for (NSUInteger i = 0; i < [serialArr count]; i++) {
+            NSDictionary *ser = serialArr[i];
+            if (![ser isKindOfClass:[NSDictionary class]]) continue;
+
+            NSString *mode = ser[@"Mode"] ?: @"Builtin";
+            NSString *target = ser[@"Target"] ?: @"Auto";
+
+            [args addObject:@"-chardev"];
+            if ([mode isEqualToString:@"TcpClient"]) {
+                NSString *host = ser[@"TcpHostAddress"] ?: @"localhost";
+                NSNumber *port = ser[@"TcpPort"] ?: @1234;
+                [args addObject:[NSString stringWithFormat:@"socket,id=term%lu,host=%@,port=%@,server=off",
+                                (unsigned long)i, host, port]];
+            } else if ([mode isEqualToString:@"TcpServer"]) {
+                NSString *bindAddr = [ser[@"IsRemoteConnectionAllowed"] boolValue] ? @"0.0.0.0" : @"127.0.0.1";
+                NSNumber *port = ser[@"TcpPort"] ?: @1234;
+                NSString *wait = [ser[@"IsWaitForConnection"] boolValue] ? @"on" : @"off";
+                [args addObject:[NSString stringWithFormat:@"socket,id=term%lu,host=%@,port=%@,server=on,wait=%@",
+                                (unsigned long)i, bindAddr, port, wait]];
+            } else {
+                [args addObject:[NSString stringWithFormat:@"spiceport,id=term%lu,name=com.utmapp.terminal.%lu",
+                                (unsigned long)i, (unsigned long)i]];
+            }
+
+            if ([target isEqualToString:@"Auto"]) {
+                [args addObject:@"-serial"];
+                [args addObject:[NSString stringWithFormat:@"chardev:term%lu", (unsigned long)i]];
+            } else if ([target isEqualToString:@"Manual"]) {
+                NSString *hw = ser[@"Hardware"] ?: @"isa-serial";
+                [args addObject:@"-device"];
+                [args addObject:[NSString stringWithFormat:@"%@,chardev=term%lu", hw, (unsigned long)i]];
+            } else if ([target isEqualToString:@"Monitor"]) {
+                [args addObject:@"-mon"];
+                [args addObject:[NSString stringWithFormat:@"chardev=term%lu,mode=readline", (unsigned long)i]];
+            } else if ([target isEqualToString:@"GDB"]) {
+                [args addObject:@"-gdb"];
+                [args addObject:[NSString stringWithFormat:@"chardev:term%lu", (unsigned long)i]];
+            }
+        }
     }
 
-    NSUInteger ncpu = _cpuCount > 0 ? _cpuCount : 1;
-    [args addObject:@"-smp"];
-    [args addObject:[NSString stringWithFormat:@"cpus=%lu,sockets=1,cores=%lu,threads=1",
-                     (unsigned long)ncpu, (unsigned long)ncpu]];
+    /* === 8. CPU + SMP === */
+    {
+        if (wantsHostCPU) {
+            [args addObject:@"-cpu"];
+            [args addObject:@"host"];
+        } else if (![_cpu isEqualToString:@"default"]) {
+            [args addObject:@"-cpu"];
+            NSMutableString *cpuArg = [NSMutableString stringWithString:_cpu];
+            for (NSString *flag in cpuFlagsAdd) {
+                if ([flag length] > 0) {
+                    [cpuArg appendFormat:@",+%@", flag];
+                }
+            }
+            for (NSString *flag in cpuFlagsRemove) {
+                if ([flag length] > 0) {
+                    [cpuArg appendFormat:@",-%@", flag];
+                }
+            }
+            [args addObject:cpuArg];
+        } else if ([_architecture isEqualToString:@"aarch64"]) {
+            [args addObject:@"-cpu"];
+            [args addObject:@"cortex-a72"];
+        } else if ([_architecture isEqualToString:@"arm"]) {
+            [args addObject:@"-cpu"];
+            [args addObject:@"cortex-a15"];
+        }
 
-    /* === 8. Machine + Acceleration === */
-    [args addObject:@"-machine"];
-    [args addObject:[self targetString]];
+        NSUInteger ncpu = isSparc ? 1 : (_cpuCount > 0 ? _cpuCount : 1);
+        [args addObject:@"-smp"];
+        [args addObject:[NSString stringWithFormat:@"cpus=%lu,sockets=1,cores=%lu,threads=1",
+                         (unsigned long)ncpu, (unsigned long)ncpu]];
+    }
 
-    /* Acceleration: prefer KVM (Linux), fall back to TCG */
-    BOOL wantsHvf = NO;
-    if ([qemuSection isKindOfClass:[NSDictionary class]])
-        wantsHvf = [qemuSection[@"Hypervisor"] boolValue];
-    if (wantsHvf) {
-        if ([[NSFileManager defaultManager] isReadableFileAtPath:@"/dev/kvm"]) {
+    /* === 9. Machine + Acceleration + Boot === */
+    {
+        NSString *machineTarget = [self targetString];
+        NSString *machineProps = [self _machineProperties];
+        if ([machineProps length] > 0) {
+            machineTarget = [machineTarget stringByAppendingString:machineProps];
+        }
+        [args addObject:@"-machine"];
+        [args addObject:machineTarget];
+
+        if (isSparc) {
+            [args addObject:@"-prom-env"];
+            [args addObject:@"boot-device=disk"];
+        }
+        if (isClassicMacNewWorld) {
+            [args addObject:@"-prom-env"];
+            [args addObject:@"boot-command=init-program go"];
+        }
+
+        if (hasHypervisor && [[NSFileManager defaultManager] isReadableFileAtPath:@"/dev/kvm"]) {
             [args addObject:@"-accel"];
             [args addObject:@"kvm"];
         } else {
             [args addObject:@"-accel"];
             [args addObject:@"tcg"];
         }
-    } else {
-        [args addObject:@"-accel"];
-        [args addObject:@"tcg"];
     }
 
-    /* === 9. Architecture: UEFI pflash === */
-    BOOL hasUefi = NO;
-    if ([qemuSection isKindOfClass:[NSDictionary class]])
-        hasUefi = [qemuSection[@"UEFIBoot"] boolValue];
+    /* === 10. Architecture-specific === */
+    if (isPcCompatible) {
+        [args addObject:@"-global"];
+        [args addObject:@"PIIX4_PM.disable_s3=1"];
+        [args addObject:@"-global"];
+        [args addObject:@"ICH9-LPC.disable_s3=1"];
+    }
+
     if (hasUefi) {
-        NSString *codeFile = [NSString stringWithFormat:@"/usr/share/qemu/edk2-%@-code.fd",
-                              [_architecture isEqualToString:@"aarch64"] ? @"aarch64" : @"x86_64"];
+        NSString *prefix = [_architecture isEqualToString:@"aarch64"] ? @"aarch64" : @"x86_64";
+        NSString *codeFile = [NSString stringWithFormat:@"/usr/share/qemu/edk2-%@-code.fd", prefix];
         NSFileManager *fm = [NSFileManager defaultManager];
         if ([fm isReadableFileAtPath:codeFile]) {
-    [args addObject:@"-drive"];
-    [args addObject:[NSString stringWithFormat:@"if=pflash,format=raw,unit=0,file.filename=%@,file.locking=off,readonly=on", codeFile]];
+            [args addObject:@"-drive"];
+            [args addObject:[NSString stringWithFormat:@"if=pflash,format=raw,unit=0,file.filename=%@,file.locking=off,readonly=on", codeFile]];
         }
         NSString *varsFile = [NSTemporaryDirectory() stringByAppendingPathComponent:@"efi_vars.fd"];
         if (![fm fileExistsAtPath:varsFile]) {
-            NSString *template = [NSString stringWithFormat:@"/usr/share/qemu/edk2-%@-vars.fd",
-                                   [_architecture isEqualToString:@"aarch64"] ? @"aarch64" : @"x86_64"];
-            if ([fm isReadableFileAtPath:template])
+            NSString *template = [NSString stringWithFormat:@"/usr/share/qemu/edk2-%@-vars.fd", prefix];
+            if ([fm isReadableFileAtPath:template]) {
                 [fm copyItemAtPath:template toPath:varsFile error:NULL];
+            }
         }
-        if ([fm isReadableFileAtPath:varsFile])
-    [args addObject:@"-drive"];
-    [args addObject:[NSString stringWithFormat:@"if=pflash,unit=1,file.filename=%@", varsFile]];
-    }
-
-    /* === 10. Memory === */
-    [args addObject:@"-m"];
-    [args addObject:[NSString stringWithFormat:@"%lu", (unsigned long)(unsigned long)_memorySize]];
-
-    /* === 11. Sound === */
-    id soundArr = [_rawPlist objectForKey:@"Sound"];
-    NSString *soundHw = nil;
-    if ([soundArr isKindOfClass:[NSArray class]] && [soundArr count] > 0) {
-        id first = [soundArr objectAtIndex:0];
-        if ([first isKindOfClass:[NSDictionary class]]) soundHw = [first objectForKey:@"Hardware"];
-    } else if ([soundArr isKindOfClass:[NSDictionary class]]) {
-        soundHw = [soundArr objectForKey:@"Hardware"] ?: [soundArr objectForKey:@"SoundCard"];
-    }
-    if (soundHw || _soundEnabled) {
-        if (!soundHw) soundHw = _soundCard;
-        soundHw = [self availableDeviceFor:soundHw arch:_architecture];
-    [args addObject:@"-audiodev"];
-    [args addObject:@"alsa,id=audio0"];
-        if ([soundHw isEqualToString:@"intel-hda"]) {
-            [args addObject:@"-device"];
-            [args addObject:soundHw];
-            [args addObject:@"-device"];
-            [args addObject:@"hda-duplex,audiodev=audio0"];
-        } else {
-            [args addObject:@"-device"];
-            [args addObject:[NSString stringWithFormat:@"%@,audiodev=audio0", soundHw]];
+        if ([fm isReadableFileAtPath:varsFile]) {
+            [args addObject:@"-drive"];
+            [args addObject:[NSString stringWithFormat:@"if=pflash,unit=1,file.filename=%@", varsFile]];
         }
     }
 
-    /* === 12. USB === */
-    NSString *usbController = [self availableDeviceFor:@"nec-usb-xhci" arch:_architecture];
-    if ([_target isEqualToString:@"virt"] || [_architecture isEqualToString:@"aarch64"]) {
+    if (isClassicMacM68k) {
         [args addObject:@"-device"];
-        [args addObject:[NSString stringWithFormat:@"%@,id=usb-bus", usbController]];
-    } else {
-        [args addObject:@"-usb"];
+        [args addObject:@"nubus-virtio-mmio"];
     }
 
-    [args addObject:@"-device"];
-    [args addObject:@"usb-tablet,bus=usb-bus.0"];
-    [args addObject:@"-device"];
-    [args addObject:@"usb-mouse,bus=usb-bus.0"];
-    [args addObject:@"-device"];
-    [args addObject:@"usb-kbd,bus=usb-bus.0"];
+    /* === 11. Memory === */
+    [args addObject:@"-m"];
+    [args addObject:[NSString stringWithFormat:@"%lu", (unsigned long)_memorySize]];
 
-    /* USB redirection */
-    id inputSection = [_rawPlist objectForKey:@"Input"];
-    NSInteger maxShare = 3;
-    if ([inputSection isKindOfClass:[NSDictionary class]]) {
-        if ([inputSection objectForKey:@"MaximumUsbShare"])
-            maxShare = [[inputSection objectForKey:@"MaximumUsbShare"] integerValue];
+    /* === 12. Boot === */
+    if ([_bootDevice isEqualToString:@"cd"]) {
+        [args addObject:@"-boot"];
+        [args addObject:@"once=d,order=c"];
+    } else if ([_bootDevice isEqualToString:@"disk"]) {
+        [args addObject:@"-boot"];
+        [args addObject:@"order=c"];
     }
-    if (maxShare > 0) {
-    [args addObject:@"-device"];
-    [args addObject:@"qemu-xhci,id=usb-controller-0"];
-        for (int i = 0; i < maxShare && i < 3; i++) {
-            [args addObject:@"-chardev"];
-            [args addObject:[NSString stringWithFormat:@"spicevmc,name=usbredir,id=usbredirchardev%d", i]];
+
+    /* === 13. Sound === */
+    {
+        NSString *soundHw = nil;
+        if ([soundObj isKindOfClass:[NSArray class]] && [soundObj count] > 0) {
+            id first = [soundObj objectAtIndex:0];
+            if ([first isKindOfClass:[NSDictionary class]]) soundHw = [first objectForKey:@"Hardware"];
+        } else if ([soundObj isKindOfClass:[NSDictionary class]]) {
+            soundHw = [soundObj objectForKey:@"Hardware"] ?: [soundObj objectForKey:@"SoundCard"];
+        }
+        if (soundHw || _soundEnabled) {
+            if (!soundHw) soundHw = _soundCard;
+            soundHw = [self availableDeviceFor:soundHw arch:_architecture];
+            if (soundHw && [soundHw length] > 0) {
+                [args addObject:@"-audiodev"];
+                [args addObject:@"alsa,id=audio0"];
+                if ([soundHw isEqualToString:@"intel-hda"]) {
+                    [args addObject:@"-device"];
+                    [args addObject:soundHw];
+                    [args addObject:@"-device"];
+                    [args addObject:@"hda-duplex,audiodev=audio0"];
+                } else {
+                    [args addObject:@"-device"];
+                    [args addObject:[NSString stringWithFormat:@"%@,audiodev=audio0", soundHw]];
+                }
+            }
+        }
+    }
+
+    /* === 14. USB (skip for SPARC/m68k/s390x / legacy input) === */
+    if (isUsbUsed) {
+        NSString *usbCtrl = [self availableDeviceFor:@"nec-usb-xhci" arch:_architecture];
+        if ([_target isEqualToString:@"virt"] || [_architecture isEqualToString:@"aarch64"]) {
             [args addObject:@"-device"];
-            [args addObject:[NSString stringWithFormat:@"usb-redir,chardev=usbredirchardev%d,id=usbredirdev%d,bus=usb-controller-0.0", i, i]];
+            [args addObject:[NSString stringWithFormat:@"%@,id=usb-bus", usbCtrl]];
+        } else {
+            [args addObject:@"-usb"];
+        }
+
+        if (!isClassicMacNewWorld) {
+            [args addObject:@"-device"];
+            [args addObject:@"usb-tablet,bus=usb-bus.0"];
+        }
+            [args addObject:@"-device"];
+            [args addObject:@"usb-mouse,bus=usb-bus.0"];
+            [args addObject:@"-device"];
+            [args addObject:@"usb-kbd,bus=usb-bus.0"];
+
+        if (maxUsbShare > 0) {
+            [args addObject:@"-device"];
+            [args addObject:@"qemu-xhci,id=usb-controller-0"];
+            for (int i = 0; i < maxUsbShare && i < 3; i++) {
+                [args addObject:@"-chardev"];
+                [args addObject:[NSString stringWithFormat:@"spicevmc,name=usbredir,id=usbredirchardev%d", i]];
+                [args addObject:@"-device"];
+                [args addObject:[NSString stringWithFormat:@"usb-redir,chardev=usbredirchardev%d,id=usbredirdev%d,bus=usb-controller-0.0", i, i]];
+            }
         }
     }
 
-    /* === 13. Drives === */
-    int bootIdx = 0;
-    for (NSDictionary *drive in _drives) {
-        NSString *imagePath = drive[@"ImagePath"] ?: drive[@"ImageName"];
-        NSString *imageType = drive[@"ImageType"] ?: @"disk";
-        NSString *interface = drive[@"InterfaceType"] ?: drive[@"Interface"] ?: @"ide";
-        NSString *identifier = drive[@"Identifier"];
-        BOOL isCd = [imageType isEqualToString:@"CD"] || [imageType isEqualToString:@"cd"];
-        BOOL isDisk = [imageType isEqualToString:@"Disk"] || [imageType isEqualToString:@"disk"];
-        BOOL removable = [drive[@"Removable"] boolValue];
-        BOOL readOnly = [drive[@"ReadOnly"] boolValue];
-        NSString *driveId = identifier ? [NSString stringWithFormat:@"drive%@", identifier] :
-                                         [NSString stringWithFormat:@"drive%d", bootIdx];
+    /* === 15. Other Inputs (classic mac) === */
+    if (isClassicMacNewWorld) {
+        [args addObject:@"-device"];
+        [args addObject:@"virtio-tablet-pci"];
+    }
+    if (isClassicMacM68k) {
+        [args addObject:@"-device"];
+        [args addObject:@"virtio-tablet-device"];
+    }
 
-        /* A CD with no image path is still a removable device */
-        BOOL actuallyRemovable = removable || (isCd && !imagePath);
-        if (imagePath || actuallyRemovable) {
-            NSString *dev = [self availableDeviceFor:[self driveInterfaceDevice:interface imageType:imageType] arch:_architecture];
-            NSMutableString *devArg = [NSMutableString stringWithFormat:@"%@,drive=%@", dev, driveId];
-            /* Only add removable=true for non-CD devices that are removable.
-               CD device types (ide-cd, scsi-cd, usb-storage with CD) already imply removable. */
-            if (!isCd && actuallyRemovable) [devArg appendString:@",removable=true"];
-            [devArg appendString:[NSString stringWithFormat:@",bootindex=%d", bootIdx]];
-            if (isDisk && [identifier length] > 0) {
-                NSString *serial = [[identifier stringByReplacingOccurrencesOfString:@"-" withString:@""] substringToIndex:20];
-                [devArg appendString:[NSString stringWithFormat:@",serial=%@", serial]];
-            }
-            if ([dev isEqualToString:@"usb-storage"]) [devArg appendString:@",bus=usb-bus.0"];
-    [args addObject:@"-device"];
-    [args addObject:devArg];
+    /* === 16. Drives === */
+    {
+        int bootIdx = 0;
+        for (NSDictionary *drive in _drives) {
+            NSString *imagePath = drive[@"ImagePath"] ?: drive[@"ImageName"];
+            NSString *imageType = drive[@"ImageType"] ?: @"disk";
+            NSString *interface = drive[@"InterfaceType"] ?: drive[@"Interface"] ?: @"ide";
+            NSString *identifier = drive[@"Identifier"];
+            BOOL isCd = [imageType caseInsensitiveCompare:@"cd"] == NSOrderedSame;
+            BOOL isDisk = [imageType caseInsensitiveCompare:@"disk"] == NSOrderedSame;
+            BOOL isBios = [imageType caseInsensitiveCompare:@"bios"] == NSOrderedSame;
+            BOOL isKernel = [imageType caseInsensitiveCompare:@"LinuxKernel"] == NSOrderedSame;
+            BOOL isInitrd = [imageType caseInsensitiveCompare:@"LinuxInitrd"] == NSOrderedSame;
+            BOOL isDtb = [imageType caseInsensitiveCompare:@"LinuxDTB"] == NSOrderedSame;
+            BOOL removable = [drive[@"Removable"] boolValue];
+            BOOL readOnly = [drive[@"ReadOnly"] boolValue];
 
-            NSMutableString *driveArg = [NSMutableString stringWithFormat:@"if=none,media=%@,id=%@",
-                                          isCd ? @"cdrom" : @"disk", driveId];
-            if (imagePath) {
-                [driveArg appendString:[NSString stringWithFormat:@",file.filename=%@", imagePath]];
-            } else if (isCd || actuallyRemovable) {
-                [driveArg appendString:@",file.filename=/dev/null"];
+            if (isBios && imagePath) {
+                [args addObject:@"-bios"];
+                [args addObject:imagePath];
+                continue;
             }
-            if (isCd || actuallyRemovable || readOnly) [driveArg appendString:@",file.locking=off,readonly=on"];
-            if (isDisk) [driveArg appendString:@",discard=unmap,detect-zeroes=unmap"];
-    [args addObject:@"-drive"];
-    [args addObject:driveArg];
-            bootIdx++;
+            if (isKernel && imagePath) {
+                [args addObject:@"-kernel"];
+                [args addObject:imagePath];
+                continue;
+            }
+            if (isInitrd && imagePath) {
+                [args addObject:@"-initrd"];
+                [args addObject:imagePath];
+                continue;
+            }
+            if (isDtb && imagePath) {
+                [args addObject:@"-dtb"];
+                [args addObject:imagePath];
+                continue;
+            }
+
+            if (!isDisk && !isCd) continue;
+
+            NSString *driveId = identifier ? [NSString stringWithFormat:@"drive%@", identifier] :
+                                             [NSString stringWithFormat:@"drive%d", bootIdx];
+            BOOL actuallyRemovable = removable || (isCd && !imagePath);
+            if (!imagePath && !actuallyRemovable) continue;
+
+            NSString *iface = [interface lowercaseString];
+
+            /* ---- IDE ---- */
+            if ([iface isEqualToString:@"ide"]) {
+                NSString *devName = isCd ? @"ide-cd" : @"ide-hd";
+                NSMutableString *devArg = [NSMutableString stringWithFormat:@"%@,drive=%@", devName, driveId];
+                [devArg appendFormat:@",bootindex=%d", bootIdx];
+                [args addObject:@"-device"];
+                [args addObject:devArg];
+
+                NSMutableString *driveArg = [NSMutableString stringWithFormat:@"if=none,media=%@,id=%@",
+                                              isCd ? @"cdrom" : @"disk", driveId];
+                if (imagePath)
+                    [driveArg appendFormat:@",file.filename=%@", imagePath];
+                else if (isCd || actuallyRemovable)
+                    [driveArg appendString:@",file.filename=/dev/null"];
+                if (isCd || actuallyRemovable || readOnly)
+                    [driveArg appendString:@",file.locking=off,readonly=on"];
+                if (isDisk)
+                    [driveArg appendString:@",discard=unmap,detect-zeroes=unmap"];
+                [args addObject:@"-drive"];
+                [args addObject:driveArg];
+                bootIdx++;
+
+            /* ---- SCSI ---- */
+            } else if ([iface isEqualToString:@"scsi"]) {
+                BOOL hasBuiltinScsi = isSparc || isM68k;
+                if (!hasBuiltinScsi) {
+                    [args addObject:@"-device"];
+                    [args addObject:@"lsi53c895a,id=scsi0"];
+                }
+                NSString *busName = hasBuiltinScsi ? @"scsi" : @"scsi0";
+                NSString *devName = isCd ? @"scsi-cd" : @"scsi-hd";
+                NSMutableString *devArg = [NSMutableString stringWithFormat:@"%@,bus=%@.0,channel=0,scsi-id=%d,drive=%@",
+                                            devName, busName, bootIdx, driveId];
+                if (!isSparc) {
+                    [devArg appendFormat:@",bootindex=%d", bootIdx];
+                }
+                [args addObject:@"-device"];
+                [args addObject:devArg];
+
+                NSMutableString *driveArg = [NSMutableString stringWithFormat:@"if=none,media=%@,id=%@",
+                                              isCd ? @"cdrom" : @"disk", driveId];
+                if (imagePath)
+                    [driveArg appendFormat:@",file.filename=%@", imagePath];
+                else if (isCd || actuallyRemovable)
+                    [driveArg appendString:@",file.filename=/dev/null"];
+                if (isCd || actuallyRemovable || readOnly)
+                    [driveArg appendString:@",file.locking=off,readonly=on"];
+                if (isDisk)
+                    [driveArg appendString:@",discard=unmap,detect-zeroes=unmap"];
+                [args addObject:@"-drive"];
+                [args addObject:driveArg];
+                bootIdx++;
+
+            /* ---- VirtIO ---- */
+            } else if ([iface isEqualToString:@"virtio"]) {
+                NSString *virtioDev;
+                if (isS390x)
+                    virtioDev = @"virtio-blk-ccw";
+                else if (isM68k)
+                    virtioDev = @"virtio-blk-device";
+                else
+                    virtioDev = @"virtio-blk-pci";
+                NSMutableString *devArg = [NSMutableString stringWithFormat:@"%@,drive=%@", virtioDev, driveId];
+                if (identifier && [identifier length] > 0) {
+                    NSString *serial = [[identifier stringByReplacingOccurrencesOfString:@"-" withString:@""] substringToIndex:20];
+                    [devArg appendFormat:@",serial=%@", serial];
+                }
+                [devArg appendFormat:@",bootindex=%d", bootIdx];
+                [args addObject:@"-device"];
+                [args addObject:devArg];
+
+                NSMutableString *driveArg = [NSMutableString stringWithFormat:@"if=none,media=%@,id=%@",
+                                              isCd ? @"cdrom" : @"disk", driveId];
+                if (imagePath)
+                    [driveArg appendFormat:@",file.filename=%@", imagePath];
+                else if (isCd || actuallyRemovable)
+                    [driveArg appendString:@",file.filename=/dev/null"];
+                if (isCd || actuallyRemovable || readOnly)
+                    [driveArg appendString:@",file.locking=off,readonly=on"];
+                if (isDisk)
+                    [driveArg appendString:@",discard=unmap,detect-zeroes=unmap"];
+                [args addObject:@"-drive"];
+                [args addObject:driveArg];
+                bootIdx++;
+
+            /* ---- NVMe ---- */
+            } else if ([iface isEqualToString:@"nvme"]) {
+                NSMutableString *devArg = [NSMutableString stringWithFormat:@"nvme,drive=%@,serial=%@",
+                                            driveId, driveId];
+                [devArg appendFormat:@",bootindex=%d", bootIdx];
+                [args addObject:@"-device"];
+                [args addObject:devArg];
+
+                NSMutableString *driveArg = [NSMutableString stringWithFormat:@"if=none,media=%@,id=%@",
+                                              isCd ? @"cdrom" : @"disk", driveId];
+                if (imagePath)
+                    [driveArg appendFormat:@",file.filename=%@", imagePath];
+                else if (isCd || actuallyRemovable)
+                    [driveArg appendString:@",file.filename=/dev/null"];
+                if (isCd || actuallyRemovable || readOnly)
+                    [driveArg appendString:@",file.locking=off,readonly=on"];
+                if (isDisk)
+                    [driveArg appendString:@",discard=unmap,detect-zeroes=unmap"];
+                [args addObject:@"-drive"];
+                [args addObject:driveArg];
+                bootIdx++;
+
+            /* ---- USB ---- */
+            } else if ([iface isEqualToString:@"usb"]) {
+                NSMutableString *devArg = [NSMutableString stringWithFormat:@"usb-storage,drive=%@,removable=%s",
+                                            driveId, actuallyRemovable ? "true" : "false"];
+                if (hasUsb && [_target hasPrefix:@"virt"])
+                    [devArg appendString:@",bus=usb-bus.0"];
+                [devArg appendFormat:@",bootindex=%d", bootIdx];
+                [args addObject:@"-device"];
+                [args addObject:devArg];
+
+                NSMutableString *driveArg = [NSMutableString stringWithFormat:@"if=none,media=%@,id=%@",
+                                              isCd ? @"cdrom" : @"disk", driveId];
+                if (imagePath)
+                    [driveArg appendFormat:@",file.filename=%@", imagePath];
+                else if (isCd || actuallyRemovable)
+                    [driveArg appendString:@",file.filename=/dev/null"];
+                if (isCd || actuallyRemovable || readOnly)
+                    [driveArg appendString:@",file.locking=off,readonly=on"];
+                if (isDisk)
+                    [driveArg appendString:@",discard=unmap,detect-zeroes=unmap"];
+                [args addObject:@"-drive"];
+                [args addObject:driveArg];
+                bootIdx++;
+
+            /* ---- Floppy ---- */
+            } else if ([iface isEqualToString:@"floppy"] && [self _isPcCompatible]) {
+                [args addObject:@"-device"];
+                [args addObject:[NSString stringWithFormat:@"isa-fdc,id=fdc%d", bootIdx]];
+                [args addObject:@"-device"];
+                [args addObject:[NSString stringWithFormat:@"floppy,unit=0,bus=fdc%d.0,drive=%@", bootIdx, driveId]];
+
+                NSMutableString *driveArg = [NSMutableString stringWithFormat:@"if=floppy,id=%@", driveId];
+                if (imagePath)
+                    [driveArg appendFormat:@",file.filename=%@", imagePath];
+                [args addObject:@"-drive"];
+                [args addObject:driveArg];
+                bootIdx++;
+            }
         }
     }
 
-    /* === 14. Sharing (virtio-serial + agents) === */
-    [args addObject:@"-device"];
-    [args addObject:@"virtio-serial"];
-    [args addObject:@"-device"];
-    [args addObject:@"virtserialport,bus=virtio-serial-bus.0,chardev=org.qemu.guest_agent,name=org.qemu.guest_agent.0"];
-    [args addObject:@"-chardev"];
-    [args addObject:@"spiceport,name=org.qemu.guest_agent.0,id=org.qemu.guest_agent"];
-    [args addObject:@"-device"];
-    [args addObject:@"virtserialport,bus=virtio-serial-bus.0,chardev=vdagent,name=com.redhat.spice.0"];
-    [args addObject:@"-chardev"];
-    [args addObject:@"spicevmc,id=vdagent,debug=0,name=vdagent"];
-    [args addObject:@"-device"];
-    [args addObject:@"virtserialport,bus=virtio-serial-bus.0,chardev=charchannel1,id=channel1,name=org.spice-space.webdav.0"];
-    [args addObject:@"-chardev"];
-    [args addObject:@"spiceport,name=org.spice-space.webdav.0,id=charchannel1"];
+    /* === 17. Sharing (virtio-serial + agents) === */
+    if (hasAgent) {
+        [args addObject:@"-device"];
+        [args addObject:@"virtio-serial"];
 
-    /* === 15. Name and UUID === */
+        if (clipboardSharing) {
+            [args addObject:@"-device"];
+            [args addObject:@"virtserialport,bus=virtio-serial-bus.0,chardev=org.qemu.guest_agent,name=org.qemu.guest_agent.0"];
+            [args addObject:@"-chardev"];
+            [args addObject:@"spiceport,name=org.qemu.guest_agent.0,id=org.qemu.guest_agent"];
+        }
+
+        if (clipboardSharing || directorySharing) {
+            [args addObject:@"-device"];
+            [args addObject:@"virtserialport,bus=virtio-serial-bus.0,chardev=vdagent,name=com.redhat.spice.0"];
+            [args addObject:@"-chardev"];
+            [args addObject:@"spicevmc,id=vdagent,debug=0,name=vdagent"];
+
+            if (directorySharing) {
+                [args addObject:@"-device"];
+                [args addObject:@"virtserialport,bus=virtio-serial-bus.0,chardev=charchannel1,id=channel1,name=org.spice-space.webdav.0"];
+                [args addObject:@"-chardev"];
+                [args addObject:@"spiceport,name=org.spice-space.webdav.0,id=charchannel1"];
+            }
+        }
+    }
+
+    /* === 17. Name and UUID === */
     [args addObject:@"-name"];
-    [args addObject:_name ?: @"Virtual Machine"];
+    [args addObject:[self _cleanupName:_name ?: @"Virtual Machine"]];
+    if (isDisposable) {
+        [args addObject:@"-snapshot"];
+    }
     [args addObject:@"-uuid"];
     [args addObject:uuid];
 
-    /* === 16. RNG === */
-    BOOL hasRng = NO;
-    if ([qemuSection isKindOfClass:[NSDictionary class]]) hasRng = [qemuSection[@"RNGDevice"] boolValue];
+    /* === 18. RTC === */
+    if (hasRtcLocalTime) {
+        [args addObject:@"-rtc"];
+        [args addObject:@"base=localtime"];
+    }
+
+    /* === 19. RNG + Balloon === */
     if (hasRng) {
         [args addObject:@"-device"];
         [args addObject:@"virtio-rng-pci"];
     }
+    if (hasBalloon) {
+        [args addObject:@"-device"];
+        [args addObject:@"virtio-balloon-pci"];
+    }
 
-    /* === 17. Extra arguments === */
+    /* === 20. Extra arguments === */
     if ([_extraArguments length] > 0) {
         NSArray *extra = [_extraArguments componentsSeparatedByCharactersInSet:
                           [NSCharacterSet whitespaceCharacterSet]];

@@ -3,6 +3,24 @@
 #import "GSUTMAssistant.h"
 #import "AppearanceMetrics.h"
 
+@interface VMTableView : NSTableView @end
+@implementation VMTableView
+- (void)keyDown:(NSEvent *)event
+{
+    NSString *chars = [event characters];
+    if ([chars length] == 1) {
+        unichar c = [chars characterAtIndex:0];
+        if (c == NSDeleteCharacter || c == 0x7F) {
+            id del = [self delegate];
+            if ([del respondsToSelector:@selector(_ctxRemove:)])
+                [del performSelector:@selector(_ctxRemove:) withObject:self];
+            return;
+        }
+    }
+    [super keyDown:event];
+}
+@end
+
 @interface GSUTMMainWindowController () <NSTableViewDataSource, NSTableViewDelegate>
 {
     GSUTMConfiguration *_configuration;
@@ -138,7 +156,7 @@
     CGFloat by = (bottomH - METRICS_BUTTON_HEIGHT) / 2;
 
     /* VM List */
-    _tableView = [[NSTableView alloc] initWithFrame:NSMakeRect(0, bottomH, winW, winH - bottomH)];
+    _tableView = [[VMTableView alloc] initWithFrame:NSMakeRect(0, bottomH, winW, winH - bottomH)];
     NSTableColumn *col = [[NSTableColumn alloc] initWithIdentifier:@"name"];
     [[col headerCell] setStringValue:@"Virtual Machines"];
     [col setWidth:winW - 20];
@@ -159,6 +177,7 @@
     [_tableView setDelegate:self];
     [_tableView setTarget:self];
     [_tableView setAction:@selector(_selectionChanged)];
+    [_tableView setDoubleAction:@selector(_ctxStart:)];
 
     /* Context menu for the table */
     NSMenu *ctxMenu = [[NSMenu alloc] init];
@@ -414,6 +433,14 @@
     }
 }
 
+- (BOOL)_vmListContainsURL:(NSString *)path
+{
+    for (GSUTMConfiguration *cfg in _vmEntries) {
+        if ([cfg.baseURL.path isEqualToString:path]) return YES;
+    }
+    return NO;
+}
+
 - (void)loadConfigFromURL:(NSURL *)url
 {
     NSURL *configURL = url;
@@ -438,7 +465,9 @@
         _configPath = [[configURL path] retain];
         _vmLoaded = YES;
         [_configuration retain];
-        [_vmEntries addObject:_configuration];
+        if (![self _vmListContainsURL:_configPath]) {
+            [_vmEntries addObject:_configuration];
+        }
         [_tableView reloadData];
         [_tableView selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
         [self syncUIToConfig];
@@ -453,6 +482,7 @@
         if (cfg.baseURL) [paths addObject:[cfg.baseURL path]];
     }
     [[NSUserDefaults standardUserDefaults] setObject:paths forKey:@"VMList"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
 }
 
 - (void)_loadVMList
@@ -513,6 +543,9 @@
         id obj = [sender representedObject];
         if (obj) return [obj integerValue];
     }
+    if (sender == _tableView) {
+        return [_tableView selectedRow];
+    }
     return [_tableView clickedRow];
 }
 
@@ -569,6 +602,7 @@
     NSInteger row = [self _rowFromSender:sender];
     if (row >= 0) {
         [_vmEntries removeObjectAtIndex:row];
+        [self _saveVMList];
         [_tableView reloadData];
         [_startStopButton setEnabled:NO];
         [_statusLabel setStringValue:@"Status: Stopped"];

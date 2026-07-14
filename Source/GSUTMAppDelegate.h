@@ -11,6 +11,8 @@
     NSString *_pendingOpenPath;
 }
 
+@property (retain) NSString *pendingOpenPath;
+
 - (IBAction)showAboutPanel:(id)sender;
 - (IBAction)newVM:(id)sender;
 - (IBAction)openVM:(id)sender;
