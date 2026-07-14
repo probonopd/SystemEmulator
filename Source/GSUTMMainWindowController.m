@@ -324,6 +324,18 @@
     GSUTMConfiguration *cfg = [_vmEntries objectAtIndex:sel];
     if (_virtualMachine && _virtualMachine.state != GSUTMMachineStateStopped) return;
 
+    /* Show notes dialog if the config has notes */
+    if ([cfg.notes length] > 0) {
+        NSAlert *alert = [[NSAlert alloc] init];
+        [alert setMessageText:cfg.name];
+        [alert setInformativeText:cfg.notes];
+        [alert addButtonWithTitle:@"Continue"];
+        [alert addButtonWithTitle:@"Cancel"];
+        NSInteger result = [alert runModal];
+        [alert release];
+        if (result != NSAlertFirstButtonReturn) return;
+    }
+
     /* Resolve relative drive paths against the config's base URL */
     if (cfg.baseURL) {
         [cfg resolveDrivePathsWithBaseURL:cfg.baseURL];
@@ -435,8 +447,11 @@
 
 - (BOOL)_vmListContainsURL:(NSString *)path
 {
+    NSString *bundleDir = path;
+    if ([[path lastPathComponent] isEqualToString:@"config.plist"])
+        bundleDir = [path stringByDeletingLastPathComponent];
     for (GSUTMConfiguration *cfg in _vmEntries) {
-        if ([cfg.baseURL.path isEqualToString:path]) return YES;
+        if ([cfg.baseURL.path isEqualToString:bundleDir]) return YES;
     }
     return NO;
 }
