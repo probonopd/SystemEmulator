@@ -333,7 +333,7 @@ NSString *const GSUTMErrorDomain = @"GSUTMErrorDomain";
 {
     NSFileManager *fm = [NSFileManager defaultManager];
     for (NSMutableDictionary *drive in _drives) {
-        NSString *path = drive[@"ImagePath"];
+        NSString *path = drive[@"ImagePath"] ?: drive[@"ImageName"];
         if (!path || [path length] == 0) continue;
         if ([path hasPrefix:@"~"]) { drive[@"ImagePath"] = [path stringByExpandingTildeInPath]; continue; }
         if ([path isAbsolutePath]) {
@@ -357,19 +357,23 @@ NSString *const GSUTMErrorDomain = @"GSUTMErrorDomain";
     return nil;
 }
 
-- (NSString *)_machineProperties
+- (NSString *)_machinePropertiesWithOverride:(NSString *)override
 {
     BOOL isPc = [self _isPcCompatible];
     BOOL isUsb = [self _hasUsbSupport];
     NSString *target = [self targetString];
     NSMutableString *props = [NSMutableString string];
+    if ([override length] > 0) {
+        [props appendString:override];
+    }
 
     if (isPc) {
-        [props appendString:@",vmport=off"];
-        if (isUsb && !_inputLegacy) {
+        if ([override rangeOfString:@"vmport="].location == NSNotFound)
+            [props appendString:@",vmport=off"];
+        if (isUsb && !_inputLegacy && [override rangeOfString:@"i8042="].location == NSNotFound)
             [props appendString:@",i8042=off"];
-        }
-        [props appendString:@",hpet=off"];
+        if ([override rangeOfString:@"hpet="].location == NSNotFound)
+            [props appendString:@",hpet=off"];
     }
 
     if ([target isEqualToString:@"virt"] || [target hasPrefix:@"virt-"]) {
@@ -409,6 +413,7 @@ NSString *const GSUTMErrorDomain = @"GSUTMErrorDomain";
     BOOL isUsbUsed = hasUsb && !_inputLegacy;
 
     id qemuSection = _rawPlist[@"QEMU"];
+    id systemSection = _rawPlist[@"System"];
     BOOL wantsHostCPU = [_cpu isEqualToString:@"host"];
     BOOL hasUefi = NO;
     BOOL hasHypervisor = NO;
@@ -419,18 +424,33 @@ NSString *const GSUTMErrorDomain = @"GSUTMErrorDomain";
     NSString *spicePassword = nil;
     NSArray *cpuFlagsAdd = nil;
     NSArray *cpuFlagsRemove = nil;
+    NSString *machinePropOverride = nil;
+    NSArray *additionalArgs = nil;
     if ([qemuSection isKindOfClass:[NSDictionary class]]) {
         hasHypervisor = [qemuSection[@"Hypervisor"] boolValue];
         hasUefi = [qemuSection[@"UEFIBoot"] boolValue];
         hasRng = [qemuSection[@"RNGDevice"] boolValue];
         hasBalloon = [qemuSection[@"BalloonDevice"] boolValue];
-        hasRtcLocalTime = [qemuSection[@"HasRTCLocalTime"] boolValue];
+        hasRtcLocalTime = [qemuSection[@"RTCLocalTime"] boolValue];
         isDisposable = [qemuSection[@"Disposable"] boolValue];
         spicePassword = qemuSection[@"SpicePassword"];
-        cpuFlagsAdd = qemuSection[@"CpuFlagsAdd"];
-        cpuFlagsRemove = qemuSection[@"CpuFlagsRemove"];
+        machinePropOverride = qemuSection[@"MachinePropertyOverride"];
+        additionalArgs = qemuSection[@"AdditionalArguments"];
         if (!wantsHostCPU && hasHypervisor) {
             wantsHostCPU = YES;
+        }
+    }
+    if ([systemSection isKindOfClass:[NSDictionary class]]) {
+        if (!cpuFlagsAdd || [cpuFlagsAdd count] == 0) cpuFlagsAdd = systemSection[@"CPUFlagsAdd"];
+        if (!cpuFlagsRemove || [cpuFlagsRemove count] == 0) cpuFlagsRemove = systemSection[@"CPUFlagsRemove"];
+    }
+    /* Also check Debug section for extra arguments string (legacy format) */
+    id debugObj = _rawPlist[@"Debug"];
+    if (!additionalArgs && [debugObj isKindOfClass:[NSDictionary class]]) {
+        NSString *argsStr = [debugObj objectForKey:@"Arguments"];
+        if (argsStr) {
+            additionalArgs = [argsStr componentsSeparatedByCharactersInSet:
+                              [NSCharacterSet whitespaceCharacterSet]];
         }
     }
 
@@ -565,7 +585,8 @@ NSString *const GSUTMErrorDomain = @"GSUTMErrorDomain";
                 }
 
                 [args addObject:@"-netdev"];
-                if ([netMode isEqualToString:@"shared"] || [netMode isEqualToString:@"emulated"]) {
+                NSString *netModeLower = [netMode lowercaseString];
+                if ([netModeLower isEqualToString:@"shared"] || [netModeLower isEqualToString:@"emulated"]) {
                     NSMutableString *netdevArg = [NSMutableString stringWithFormat:@"user,id=net%lu", (unsigned long)i];
                     NSString *guestAddr = netDict[@"VlanGuestAddress"];
                     if (guestAddr) {
@@ -593,11 +614,14 @@ NSString *const GSUTMErrorDomain = @"GSUTMErrorDomain";
                         [netdevArg appendString:@",restrict=on"];
                     }
                     [args addObject:netdevArg];
-                } else if ([netMode isEqualToString:@"bridged"]) {
-                    NSString *iface = netDict[@"BridgeInterface"] ?: @"eth0";
-                    [args addObject:[NSString stringWithFormat:@"bridge,id=net%lu,br=%@", (unsigned long)i, iface]];
-                } else if ([netMode isEqualToString:@"host"]) {
-                    [args addObject:[NSString stringWithFormat:@"user,id=net%lu,restrict=on", (unsigned long)i]];
+                } else if ([netModeLower isEqualToString:@"bridged"]) {
+                    if ([[NSFileManager defaultManager] isReadableFileAtPath:@"/etc/qemu/bridge.conf"]) {
+                        NSString *iface = netDict[@"BridgeInterface"] ?: @"eth0";
+                        [args addObject:[NSString stringWithFormat:@"bridge,id=net%lu,br=%@", (unsigned long)i, iface]];
+                    } else {
+                        [args addObject:[NSString stringWithFormat:@"user,id=net%lu", (unsigned long)i]];
+                    }
+                } else if ([netModeLower isEqualToString:@"host"]) {
                 } else {
                     [args addObject:[NSString stringWithFormat:@"user,id=net%lu", (unsigned long)i]];
                 }
@@ -684,10 +708,10 @@ NSString *const GSUTMErrorDomain = @"GSUTMErrorDomain";
     /* === 9. Machine + Acceleration + Boot === */
     {
         NSString *machineTarget = [self targetString];
-        NSString *machineProps = [self _machineProperties];
-        if ([machineProps length] > 0) {
-            machineTarget = [machineTarget stringByAppendingString:machineProps];
-        }
+        NSString *machineProps = [self _machinePropertiesWithOverride:machinePropOverride];
+    if ([machineProps length] > 0) {
+        machineTarget = [machineTarget stringByAppendingFormat:@",%@", machineProps];
+    }
         [args addObject:@"-machine"];
         [args addObject:machineTarget];
 
@@ -718,23 +742,46 @@ NSString *const GSUTMErrorDomain = @"GSUTMErrorDomain";
     }
 
     if (hasUefi) {
-        NSString *prefix = [_architecture isEqualToString:@"aarch64"] ? @"aarch64" : @"x86_64";
-        NSString *codeFile = [NSString stringWithFormat:@"/usr/share/qemu/edk2-%@-code.fd", prefix];
+        /* Search multiple known locations for UEFI firmware */
         NSFileManager *fm = [NSFileManager defaultManager];
-        if ([fm isReadableFileAtPath:codeFile]) {
+        NSString *codeFile = nil;
+        NSString *sysArch = [_architecture isEqualToString:@"aarch64"] ? @"aarch64" : @"x86_64";
+        NSArray *codeCandidates = @[
+            [NSString stringWithFormat:@"/usr/share/qemu/edk2-%@-code.fd", sysArch],
+            [NSString stringWithFormat:@"/usr/share/qemu/edk2-%@-code.fd", _architecture],
+            @"/usr/share/qemu/OVMF.fd",
+            @"/usr/share/OVMF/OVMF_CODE_4M.fd",
+            @"/usr/share/OVMF/OVMF_CODE.fd",
+        ];
+        for (NSString *candidate in codeCandidates) {
+            if ([fm isReadableFileAtPath:candidate]) {
+                codeFile = candidate;
+                break;
+            }
+        }
+        if (codeFile) {
             [args addObject:@"-drive"];
             [args addObject:[NSString stringWithFormat:@"if=pflash,format=raw,unit=0,file.filename=%@,file.locking=off,readonly=on", codeFile]];
         }
         NSString *varsFile = [NSTemporaryDirectory() stringByAppendingPathComponent:@"efi_vars.fd"];
         if (![fm fileExistsAtPath:varsFile]) {
-            NSString *template = [NSString stringWithFormat:@"/usr/share/qemu/edk2-%@-vars.fd", prefix];
-            if ([fm isReadableFileAtPath:template]) {
-                [fm copyItemAtPath:template toPath:varsFile error:NULL];
+            NSArray *varsCandidates = @[
+                [NSString stringWithFormat:@"/usr/share/qemu/edk2-%@-vars.fd", sysArch],
+                [NSString stringWithFormat:@"/usr/share/qemu/edk2-%@-vars.fd", _architecture],
+                @"/usr/share/qemu/OVMF_VARS.fd",
+                @"/usr/share/OVMF/OVMF_VARS_4M.fd",
+                @"/usr/share/OVMF/OVMF_VARS.fd",
+            ];
+            for (NSString *candidate in varsCandidates) {
+                if ([fm isReadableFileAtPath:candidate]) {
+                    [fm copyItemAtPath:candidate toPath:varsFile error:NULL];
+                    break;
+                }
             }
         }
         if ([fm isReadableFileAtPath:varsFile]) {
             [args addObject:@"-drive"];
-            [args addObject:[NSString stringWithFormat:@"if=pflash,unit=1,file.filename=%@", varsFile]];
+            [args addObject:[NSString stringWithFormat:@"if=pflash,format=raw,unit=1,file.filename=%@", varsFile]];
         }
     }
 
@@ -1077,7 +1124,16 @@ NSString *const GSUTMErrorDomain = @"GSUTMErrorDomain";
     }
 
     /* === 20. Extra arguments === */
-    if ([_extraArguments length] > 0) {
+    if ([additionalArgs count] > 0) {
+        for (NSString *arg in additionalArgs) {
+            if ([arg length] == 0 || [arg hasPrefix:@"-usbdevice"]) continue;
+            NSArray *split = [arg componentsSeparatedByCharactersInSet:
+                              [NSCharacterSet whitespaceCharacterSet]];
+            for (NSString *part in split) {
+                if ([part length] > 0) [args addObject:part];
+            }
+        }
+    } else if ([_extraArguments length] > 0) {
         NSArray *extra = [_extraArguments componentsSeparatedByCharactersInSet:
                           [NSCharacterSet whitespaceCharacterSet]];
         for (NSString *arg in extra) {
@@ -1092,23 +1148,39 @@ NSString *const GSUTMErrorDomain = @"GSUTMErrorDomain";
 
 - (BOOL)saveToURL:(NSURL *)url error:(NSError **)error
 {
-    NSMutableDictionary *plist = [NSMutableDictionary dictionary];
+    /* Start from rawPlist to preserve any keys we don't manage */
+    NSMutableDictionary *plist = [(_rawPlist ?: @{}) mutableCopy];
+
     plist[@"ConfigurationVersion"] = @2;
+
+    /* Info section: merge with _name, _iconName, _notes */
     NSMutableDictionary *info = [NSMutableDictionary dictionary];
-    info[@"Name"] = _name;
-    if (_iconName) info[@"Icon"] = _iconName;
+    id oldInfo = plist[@"Info"];
+    if ([oldInfo isKindOfClass:[NSDictionary class]])
+        info = [[oldInfo mutableCopy] autorelease];
+    info[@"Name"] = _name ?: @"";
+    if (_iconName)
+        info[@"Icon"] = _iconName;
     info[@"IconCustom"] = @(_iconName != nil);
-    if (_notes) info[@"Notes"] = _notes;
+    if (_notes)
+        info[@"Notes"] = _notes;
     plist[@"Info"] = info;
+
+    /* System section: merge */
     NSMutableDictionary *system = [NSMutableDictionary dictionary];
+    id oldSystem = plist[@"System"];
+    if ([oldSystem isKindOfClass:[NSDictionary class]])
+        system = [[oldSystem mutableCopy] autorelease];
     system[@"Architecture"] = _architecture;
     system[@"Target"] = _target;
     system[@"CPU"] = _cpu;
     system[@"Memory"] = @(_memorySize);
     system[@"CPUCount"] = @(_cpuCount);
     system[@"BootDevice"] = _bootDevice;
+    /* Preserve MemorySize, CPUFlagsAdd, CPUFlagsRemove, ForceMulticore, etc. */
     plist[@"System"] = system;
-    /* Convert absolute drive paths to relative to Images/ */
+
+    /* Drives: convert absolute paths to relative */
     NSMutableArray *savedDrives = [NSMutableArray arrayWithCapacity:[_drives count]];
     for (NSDictionary *drive in _drives) {
         NSMutableDictionary *d = [[drive mutableCopy] autorelease];
@@ -1125,31 +1197,58 @@ NSString *const GSUTMErrorDomain = @"GSUTMErrorDomain";
         [savedDrives addObject:d];
     }
     plist[@"Drives"] = savedDrives;
+
+    /* Networking section: merge */
     NSMutableDictionary *network = [NSMutableDictionary dictionary];
+    id oldNet = plist[@"Networking"];
+    if ([oldNet isKindOfClass:[NSDictionary class]])
+        network = [[oldNet mutableCopy] autorelease];
     network[@"NetworkCard"] = _networkCard;
     network[@"NetworkEnabled"] = @(_networkEnabled);
     plist[@"Networking"] = network;
+
+    /* Sound section: merge */
     NSMutableDictionary *sound = [NSMutableDictionary dictionary];
+    id oldSound = plist[@"Sound"];
+    if ([oldSound isKindOfClass:[NSDictionary class]])
+        sound = [[oldSound mutableCopy] autorelease];
     sound[@"SoundCard"] = _soundCard;
     sound[@"SoundEnabled"] = @(_soundEnabled);
     plist[@"Sound"] = sound;
+
+    /* Sharing: merge */
     NSMutableDictionary *sharing = [NSMutableDictionary dictionary];
+    id oldSharing = plist[@"Sharing"];
+    if ([oldSharing isKindOfClass:[NSDictionary class]])
+        sharing = [[oldSharing mutableCopy] autorelease];
     sharing[@"ClipboardSharing"] = @(_clipboardSharing);
     sharing[@"DirectorySharing"] = @(_directorySharing);
     plist[@"Sharing"] = sharing;
+
+    /* Input: merge */
     NSMutableDictionary *input = [NSMutableDictionary dictionary];
+    id oldInput = plist[@"Input"];
+    if ([oldInput isKindOfClass:[NSDictionary class]])
+        input = [[oldInput mutableCopy] autorelease];
     input[@"InputLegacy"] = @(_inputLegacy);
     plist[@"Input"] = input;
+
+    /* Display: merge */
     NSMutableDictionary *display = [NSMutableDictionary dictionary];
+    id oldDisplay = plist[@"Display"];
+    if ([oldDisplay isKindOfClass:[NSDictionary class]])
+        display = [[oldDisplay mutableCopy] autorelease];
     display[@"ConsoleFont"] = _consoleFont;
     display[@"ConsoleFontSize"] = @(_consoleFontSize);
     display[@"ConsoleTheme"] = _consoleTheme;
     display[@"DisplayUpscaler"] = _displayUpscaler;
     display[@"DisplayDownscaler"] = _displayDownscaler;
     plist[@"Display"] = display;
+
     NSData *data = [NSPropertyListSerialization dataWithPropertyList:plist
                                                               format:NSPropertyListXMLFormat_v1_0
                                                              options:0 error:error];
+    [plist release];
     if (!data) return NO;
     return [data writeToURL:url options:NSDataWritingAtomic error:error];
 }
