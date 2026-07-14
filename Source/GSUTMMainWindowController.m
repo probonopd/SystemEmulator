@@ -499,7 +499,9 @@
             [_vmEntries addObject:_configuration];
         }
         [_tableView reloadData];
-        [_tableView selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
+        NSUInteger idx = [_vmEntries indexOfObject:_configuration];
+        if (idx != NSNotFound)
+            [_tableView selectRowIndexes:[NSIndexSet indexSetWithIndex:idx] byExtendingSelection:NO];
         [self syncUIToConfig];
         [self _saveVMList];
     }
